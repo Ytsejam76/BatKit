@@ -2,6 +2,8 @@
 
 use std::f32::consts::TAU;
 
+use crate::window::{window_value, Window};
+
 #[derive(Debug, Clone)]
 pub struct Probe {
     pub sample_rate: f32,
@@ -12,13 +14,6 @@ pub struct Probe {
 pub struct ProbeBuilder {
     sample_rate: f32,
     samples: Vec<f32>,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub enum Window {
-    #[default]
-    None,
-    Hann,
 }
 
 impl ProbeBuilder {
@@ -145,15 +140,7 @@ pub fn sine_ping(sample_rate: f32, duration_s: f32, freq_hz: f32, decay: f32) ->
 }
 
 pub fn apply_hann_window(samples: &mut [f32]) {
-    let len = samples.len();
-
-    if len <= 1 {
-        return;
-    }
-
-    for (n, x) in samples.iter_mut().enumerate() {
-        *x *= window_value(Window::Hann, n, len);
-    }
+    crate::window::apply_window(samples, Window::Hann);
 }
 
 pub fn normalize_peak(samples: &mut [f32]) {
@@ -162,20 +149,6 @@ pub fn normalize_peak(samples: &mut [f32]) {
     if peak > 0.0 {
         for x in samples {
             *x /= peak;
-        }
-    }
-}
-
-fn window_value(window: Window, n: usize, len: usize) -> f32 {
-    match window {
-        Window::None => 1.0,
-
-        Window::Hann => {
-            if len <= 1 {
-                1.0
-            } else {
-                0.5 - 0.5 * (TAU * n as f32 / (len - 1) as f32).cos()
-            }
         }
     }
 }

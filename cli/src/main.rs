@@ -6,8 +6,9 @@ use anyhow::{Context, Result, bail};
 use batkit::{
     correlate::matched_filter,
     peak::find_peaks,
-    probe::{Probe, ProbeBuilder, Window},
+    probe::{Probe, ProbeBuilder},
     range::delay_samples_to_distance_m,
+    window::Window,
 };
 use clap::{ArgAction, Parser, Subcommand};
 
@@ -273,6 +274,12 @@ fn option_window(options: &[&str]) -> Result<Option<Window>> {
             return match value {
                 "none" => Ok(Some(Window::None)),
                 "hann" => Ok(Some(Window::Hann)),
+                "hamming" => Ok(Some(Window::Hamming)),
+                "blackman" => Ok(Some(Window::Blackman)),
+                "kaiser" => {
+                    let beta = option_f32(options, "beta")?.unwrap_or(6.0);
+                    Ok(Some(Window::Kaiser { beta }))
+                }
                 _ => bail!("unknown window: {value}"),
             };
         }

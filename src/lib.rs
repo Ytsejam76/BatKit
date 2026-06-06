@@ -10,6 +10,7 @@ pub mod golay;
 pub mod peak;
 pub mod probe;
 pub mod range;
+pub mod window;
 
 /// Speed of sound in air in m/s
 /// See: <https://en.wikipedia.org/wiki/Speed_of_sound>

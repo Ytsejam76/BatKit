@@ -1,0 +1,15 @@
+[package]
+name = "batkit-cli"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+audio = ["dep:cpal"]
+
+[dependencies]
+batkit = { path = ".." }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+hound = "3"
+cpal = { version = "0.15", optional = true }

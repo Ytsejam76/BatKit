@@ -9,4 +9,8 @@ readme = "README.md"
 keywords = ["sonar", "dsp", "audio", "chirp", "golay"]
 categories = ["science", "multimedia::audio"]
 
+[workspace]
+resolver = "2"
+members = [".", "cli"]
+
 [dependencies]

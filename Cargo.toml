@@ -1,0 +1,12 @@
+[package]
+name = "batkit"
+version = "0.1.0"
+edition = "2021"
+description = "Tools for things that go chirp in the night."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Ytsejam76/batkit"
+readme = "README.md"
+keywords = ["sonar", "dsp", "audio", "chirp", "golay"]
+categories = ["science", "multimedia::audio"]
+
+[dependencies]

@@ -33,7 +33,7 @@ use batkit::{
 
 let sample_rate = 48_000.0;
 
-let mut probe = linear_chirp(sample_rate, 0.020, 16_000.0, 22_000.0);
+let mut probe = linear_chirp(sample_rate, 0.040, 16_000.0, 22_000.0);
 apply_hann_window(&mut probe);
 normalize_peak(&mut probe);
 

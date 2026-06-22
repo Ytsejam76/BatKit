@@ -2,6 +2,8 @@
 
 use rustfft::{num_complex::Complex, FftPlanner};
 
+use crate::window::{window_value, Window};
+
 /// Direct matched filter / valid cross-correlation.
 ///
 /// This returns one output sample for each position where the whole probe fits
@@ -88,6 +90,79 @@ pub fn gcc_phat(signal: &[f32], probe: &[f32], phat_weight: f32) -> Vec<f32> {
 
     let scale = 1.0 / fft_len as f32;
     sig_buf.iter().take(out_len).map(|c| c.re * scale).collect()
+}
+
+/// FFT-based cross-correlation with spectral whitening and a spectral window.
+///
+/// Same as `gcc_phat`, but applies `window` to the cross-spectrum bins before
+/// the IFFT. This suppresses correlation sidelobes at the cost of slightly
+/// wider peaks. Pass `Window::None` for no windowing (equivalent to
+/// `gcc_phat`).
+pub fn gcc_phat_windowed(
+    signal: &[f32],
+    probe: &[f32],
+    phat_weight: f32,
+    window: Window,
+) -> Vec<f32> {
+    if probe.is_empty() || signal.len() < probe.len() {
+        return Vec::new();
+    }
+
+    let out_len = signal.len() - probe.len() + 1;
+    let fft_len = (signal.len() + probe.len() - 1).next_power_of_two();
+
+    let mut planner = FftPlanner::new();
+    let fft = planner.plan_fft_forward(fft_len);
+    let ifft = planner.plan_fft_inverse(fft_len);
+
+    let mut sig_buf: Vec<Complex<f32>> = signal
+        .iter()
+        .map(|&x| Complex::new(x, 0.0))
+        .chain(std::iter::repeat_n(
+            Complex::new(0.0, 0.0),
+            fft_len - signal.len(),
+        ))
+        .collect();
+
+    let mut probe_buf: Vec<Complex<f32>> = probe
+        .iter()
+        .map(|&x| Complex::new(x, 0.0))
+        .chain(std::iter::repeat_n(
+            Complex::new(0.0, 0.0),
+            fft_len - probe.len(),
+        ))
+        .collect();
+
+    fft.process(&mut sig_buf);
+    fft.process(&mut probe_buf);
+
+    let epsilon = 1e-10;
+    for (k, (s, p)) in sig_buf.iter_mut().zip(probe_buf.iter()).enumerate() {
+        let cross = *s * p.conj();
+
+        let weighted = if phat_weight > 0.0 {
+            let mag = cross.norm();
+            let denom = mag.powf(phat_weight).max(epsilon);
+            cross / denom
+        } else {
+            cross
+        };
+
+        let w = window_value(window, k, fft_len);
+        *s = weighted * w;
+    }
+
+    ifft.process(&mut sig_buf);
+
+    let scale = 1.0 / fft_len as f32;
+    sig_buf.iter().take(out_len).map(|c| c.re * scale).collect()
+}
+
+/// FFT-based matched filter with a spectral window.
+///
+/// Equivalent to `gcc_phat_windowed` with `phat_weight = 0.0`.
+pub fn matched_filter_windowed(signal: &[f32], probe: &[f32], window: Window) -> Vec<f32> {
+    gcc_phat_windowed(signal, probe, 0.0, window)
 }
 
 /// Full aperiodic autocorrelation for lags `-(N-1)..=(N-1)`.

@@ -21,11 +21,14 @@ pub const SPEED_OF_SOUND_M_S: f32 = 343.0;
 #[cfg(test)]
 mod tests {
     use crate::{
-        correlate::{aperiodic_autocorrelation, gcc_phat, matched_filter, normalize_abs},
+        correlate::{
+            aperiodic_autocorrelation, gcc_phat, gcc_phat_windowed, matched_filter, normalize_abs,
+        },
         golay::generate_golay_pair,
         peak::{find_peaks, Peak},
         probe::{apply_hann_window, linear_chirp, normalize_peak},
         range::{delay_samples_to_distance_m, distance_m_to_delay_samples},
+        window::Window,
     };
 
     const SAMPLE_RATE: f32 = 48_000.0;
@@ -280,6 +283,38 @@ mod tests {
         assert!(
             (measured - echo_distance_m).abs() < 0.05,
             "PHAT measured {measured:.3} m, expected {echo_distance_m} m"
+        );
+    }
+
+    #[test]
+    fn spectral_window_reduces_sidelobes() {
+        let mut probe = linear_chirp(SAMPLE_RATE, 0.020, 16_000.0, 22_000.0);
+        apply_hann_window(&mut probe);
+        normalize_peak(&mut probe);
+
+        let rx = synthetic_recording(&probe, 1.0, &[]);
+
+        let mut no_window = gcc_phat(&rx, &probe, 0.7);
+        let mut with_window = gcc_phat_windowed(&rx, &probe, 0.7, Window::Blackman);
+
+        normalize_abs(&mut no_window);
+        normalize_abs(&mut with_window);
+
+        // Compare sidelobe energy outside the main peak region
+        let main_lobe_end = 50;
+        let sidelobe_region = main_lobe_end..no_window.len().min(with_window.len());
+
+        let no_win_sidelobe_energy: f32 = no_window[sidelobe_region.clone()]
+            .iter()
+            .map(|x| x * x)
+            .sum();
+        let with_win_sidelobe_energy: f32 =
+            with_window[sidelobe_region].iter().map(|x| x * x).sum();
+
+        assert!(
+            with_win_sidelobe_energy < no_win_sidelobe_energy,
+            "windowed sidelobes ({with_win_sidelobe_energy:.4}) should be lower than \
+             unwindowed ({no_win_sidelobe_energy:.4})"
         );
     }
 

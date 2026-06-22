@@ -1,8 +1,9 @@
 // Copyright (c) 2026 Elias S. G. Carotti
 
-use crate::correlate::{gcc_phat, matched_filter};
+use crate::correlate::{gcc_phat_windowed, matched_filter_windowed};
 use crate::coupling::CouplingProfile;
 use crate::peak::{find_peaks, parabolic_peak_offset};
+use crate::window::Window;
 
 /// Cross-correlation method used by the echo detector.
 #[derive(Debug, Clone, Copy)]
@@ -16,6 +17,7 @@ pub enum Correlator {
 pub struct EchoDetector {
     sample_rate: f32,
     correlator: Correlator,
+    window: Window,
     min_distance_m: f32,
     max_distance_m: f32,
     noise_tail_fraction: f32,
@@ -41,6 +43,7 @@ impl EchoDetector {
         Self {
             sample_rate,
             correlator: Correlator::GccPhat { weight: 0.7 },
+            window: Window::None,
             min_distance_m: 0.20,
             max_distance_m: 5.0,
             noise_tail_fraction: 0.25,
@@ -51,6 +54,16 @@ impl EchoDetector {
 
     pub fn correlator(mut self, correlator: Correlator) -> Self {
         self.correlator = correlator;
+        self
+    }
+
+    /// Spectral window applied to the cross-spectrum before the IFFT.
+    ///
+    /// Suppresses sidelobes in the correlation output at the cost of slightly
+    /// wider main-lobe peaks. `Window::None` (default) leaves the spectrum
+    /// untouched.
+    pub fn window(mut self, window: Window) -> Self {
+        self.window = window;
         self
     }
 
@@ -86,8 +99,10 @@ impl EchoDetector {
     /// first).
     pub fn detect(&self, recording: &[f32], probe: &[f32]) -> Vec<Echo> {
         let correlation = match self.correlator {
-            Correlator::MatchedFilter => matched_filter(recording, probe),
-            Correlator::GccPhat { weight } => gcc_phat(recording, probe, weight),
+            Correlator::MatchedFilter => matched_filter_windowed(recording, probe, self.window),
+            Correlator::GccPhat { weight } => {
+                gcc_phat_windowed(recording, probe, weight, self.window)
+            }
         };
 
         self.detect_in_correlation(&correlation)

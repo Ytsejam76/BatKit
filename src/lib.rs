@@ -7,6 +7,7 @@
 
 pub mod correlate;
 pub mod coupling;
+pub mod echo;
 pub mod golay;
 pub mod peak;
 pub mod probe;

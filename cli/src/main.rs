@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use batkit::{
     correlate::matched_filter,
     peak::find_peaks,
@@ -173,11 +173,7 @@ fn main() -> Result<()> {
         Command::Probe(args) => {
             let probe = build_probe(args.sample_rate, args.kind)?;
 
-            wav::write_mono_f32_wav(
-                &args.out,
-                probe.sample_rate as u32,
-                &probe.samples,
-            )?;
+            wav::write_mono_f32_wav(&args.out, probe.sample_rate as u32, &probe.samples)?;
 
             println!("wrote {}", args.out.display());
         }
@@ -272,8 +268,7 @@ fn analyze(probe_path: &Path, recording_path: &Path, min_distance_m: f32) -> Res
         .copied()
         .context("no direct peak found")?;
 
-    let min_delay_samples = ((2.0 * min_distance_m / 343.0) * sample_rate)
-        .round() as usize;
+    let min_delay_samples = ((2.0 * min_distance_m / 343.0) * sample_rate).round() as usize;
 
     let peaks = find_peaks(&corr, direct.index + min_delay_samples, threshold, 64);
 
@@ -297,13 +292,7 @@ fn play_record(play: &Path, out: &Path, record_ms: u64) -> Result<()> {
     let (sample_rate, playback) = wav::read_mono_f32_wav(play)?;
     let duration = std::time::Duration::from_millis(record_ms);
 
-    let recorded = audio::play_and_record(
-        &playback,
-        sample_rate,
-        duration,
-        1,
-        1,
-    )?;
+    let recorded = audio::play_and_record(&playback, sample_rate, duration, 1, 1)?;
 
     wav::write_mono_f32_wav(out, sample_rate, &recorded)?;
 

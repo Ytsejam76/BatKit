@@ -6,6 +6,7 @@
 //! back.
 
 pub mod correlate;
+pub mod coupling;
 pub mod golay;
 pub mod peak;
 pub mod probe;
@@ -19,7 +20,7 @@ pub const SPEED_OF_SOUND_M_S: f32 = 343.0;
 #[cfg(test)]
 mod tests {
     use crate::{
-        correlate::{aperiodic_autocorrelation, matched_filter, normalize_abs},
+        correlate::{aperiodic_autocorrelation, gcc_phat, matched_filter, normalize_abs},
         golay::generate_golay_pair,
         peak::{find_peaks, Peak},
         probe::{apply_hann_window, linear_chirp, normalize_peak},
@@ -28,11 +29,7 @@ mod tests {
 
     const SAMPLE_RATE: f32 = 48_000.0;
 
-    fn synthetic_recording(
-        probe: &[f32],
-        direct_gain: f32,
-        echoes: &[(f32, f32)],
-    ) -> Vec<f32> {
+    fn synthetic_recording(probe: &[f32], direct_gain: f32, echoes: &[(f32, f32)]) -> Vec<f32> {
         let max_echo_delay = echoes
             .iter()
             .map(|(distance_m, _)| distance_m_to_delay_samples(*distance_m, SAMPLE_RATE))
@@ -75,7 +72,10 @@ mod tests {
         let echo_start = direct.index.saturating_add(SAMPLE_RATE as usize / 2_000);
         let echo_end = direct
             .index
-            .saturating_add(distance_m_to_delay_samples(max_echo_distance_m, SAMPLE_RATE))
+            .saturating_add(distance_m_to_delay_samples(
+                max_echo_distance_m,
+                SAMPLE_RATE,
+            ))
             .min(corr.len().saturating_sub(1));
 
         let echo = find_peaks(&corr, echo_start, threshold, min_spacing)
@@ -133,10 +133,7 @@ mod tests {
         let rx = synthetic_recording(
             &probe,
             1.0,
-            &[
-                (wall_distance_m, 0.22),
-                (clutter_distance_m, 0.90),
-            ],
+            &[(wall_distance_m, 0.22), (clutter_distance_m, 0.90)],
         );
 
         let (_, echo, measured_distance) =
@@ -162,6 +159,127 @@ mod tests {
 
         assert!((measured_distance - 0.50).abs() < 0.08);
         assert!(echo.index < distance_m_to_delay_samples(4.0, SAMPLE_RATE) + 64);
+    }
+
+    #[test]
+    fn gcc_phat_matches_matched_filter_at_weight_zero() {
+        let mut probe = linear_chirp(SAMPLE_RATE, 0.020, 16_000.0, 22_000.0);
+        apply_hann_window(&mut probe);
+        normalize_peak(&mut probe);
+
+        let rx = synthetic_recording(&probe, 1.0, &[(1.25, 0.25)]);
+        let mf = matched_filter(&rx, &probe);
+        let gcc = gcc_phat(&rx, &probe, 0.0);
+
+        assert_eq!(mf.len(), gcc.len());
+
+        let max_mf = mf.iter().copied().map(f32::abs).fold(0.0, f32::max);
+        for (a, b) in mf.iter().zip(gcc.iter()) {
+            assert!(
+                (a - b).abs() < max_mf * 1e-4,
+                "gcc_phat(weight=0) should match matched_filter"
+            );
+        }
+    }
+
+    #[test]
+    fn gcc_phat_produces_sharper_peak() {
+        let mut probe = linear_chirp(SAMPLE_RATE, 0.020, 16_000.0, 22_000.0);
+        apply_hann_window(&mut probe);
+        normalize_peak(&mut probe);
+
+        let echo_distance_m = 1.25;
+        let rx = synthetic_recording(&probe, 1.0, &[(echo_distance_m, 0.25)]);
+
+        let mf = matched_filter(&rx, &probe);
+        let mut gcc = gcc_phat(&rx, &probe, 1.0);
+        normalize_abs(&mut gcc);
+
+        let mf_peak_idx = mf
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .unwrap()
+            .0;
+        let gcc_peak_idx = gcc
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .unwrap()
+            .0;
+
+        // Both should find the peak at the same location (direct path at lag 0)
+        assert!((mf_peak_idx as isize - gcc_peak_idx as isize).unsigned_abs() <= 1);
+
+        // PHAT peak should be sharper: measure width at half-max
+        fn half_max_width(signal: &[f32], peak_idx: usize) -> usize {
+            let peak_val = signal[peak_idx].abs();
+            let half = peak_val * 0.5;
+
+            let left = (0..peak_idx)
+                .rev()
+                .find(|&i| signal[i].abs() < half)
+                .unwrap_or(0);
+            let right = (peak_idx + 1..signal.len())
+                .find(|&i| signal[i].abs() < half)
+                .unwrap_or(signal.len() - 1);
+
+            right - left
+        }
+
+        let mut mf_norm = mf.clone();
+        normalize_abs(&mut mf_norm);
+
+        let mf_width = half_max_width(&mf_norm, mf_peak_idx);
+        let gcc_width = half_max_width(&gcc, gcc_peak_idx);
+
+        assert!(
+            gcc_width < mf_width,
+            "PHAT peak width ({gcc_width}) should be narrower than matched filter ({mf_width})"
+        );
+    }
+
+    #[test]
+    fn gcc_phat_detects_echo_distance() {
+        let mut probe = linear_chirp(SAMPLE_RATE, 0.020, 16_000.0, 22_000.0);
+        apply_hann_window(&mut probe);
+        normalize_peak(&mut probe);
+
+        let echo_distance_m = 1.25;
+        let echo_delay = distance_m_to_delay_samples(echo_distance_m, SAMPLE_RATE);
+        let rx = synthetic_recording(&probe, 1.0, &[(echo_distance_m, 0.25)]);
+
+        let corr = gcc_phat(&rx, &probe, 0.7);
+
+        // Direct peak should be strongest, near index 0
+        let direct_idx = corr
+            .iter()
+            .take(SAMPLE_RATE as usize / 4)
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.abs().partial_cmp(&b.abs()).unwrap())
+            .unwrap()
+            .0;
+        assert!(
+            direct_idx < 5,
+            "direct peak should be near lag 0, got {direct_idx}"
+        );
+
+        // Echo peak: search in a window around the expected delay
+        let search_start = echo_delay.saturating_sub(10);
+        let search_end = (echo_delay + 10).min(corr.len());
+        let echo_idx = corr[search_start..search_end]
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.abs().partial_cmp(&b.abs()).unwrap())
+            .unwrap()
+            .0
+            + search_start;
+
+        let measured = delay_samples_to_distance_m(echo_idx - direct_idx, SAMPLE_RATE);
+        assert!(
+            (measured - echo_distance_m).abs() < 0.05,
+            "PHAT measured {measured:.3} m, expected {echo_distance_m} m"
+        );
     }
 
     #[test]

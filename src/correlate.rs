@@ -1,4 +1,7 @@
 // Copyright (c) 2026 Elias S. G. Carotti
+
+use rustfft::{num_complex::Complex, FftPlanner};
+
 /// Direct matched filter / valid cross-correlation.
 ///
 /// This returns one output sample for each position where the whole probe fits
@@ -23,6 +26,68 @@ pub fn matched_filter(signal: &[f32], probe: &[f32]) -> Vec<f32> {
     }
 
     out
+}
+
+/// FFT-based cross-correlation with configurable phase-transform whitening.
+///
+/// `phat_weight` controls the amount of spectral whitening:
+/// - `0.0`: plain matched filter (no whitening, equivalent to time-domain)
+/// - `1.0`: full GCC-PHAT (magnitude completely discarded, sharpest peaks)
+/// - `0.0..1.0`: intermediate, raising the denominator to this power
+///
+/// Returns the linear (aperiodic) cross-correlation for non-negative lags
+/// `0..signal.len() - probe.len() + 1`, matching the output size of
+/// `matched_filter`.
+pub fn gcc_phat(signal: &[f32], probe: &[f32], phat_weight: f32) -> Vec<f32> {
+    if probe.is_empty() || signal.len() < probe.len() {
+        return Vec::new();
+    }
+
+    let out_len = signal.len() - probe.len() + 1;
+    let fft_len = (signal.len() + probe.len() - 1).next_power_of_two();
+
+    let mut planner = FftPlanner::new();
+    let fft = planner.plan_fft_forward(fft_len);
+    let ifft = planner.plan_fft_inverse(fft_len);
+
+    let mut sig_buf: Vec<Complex<f32>> = signal
+        .iter()
+        .map(|&x| Complex::new(x, 0.0))
+        .chain(std::iter::repeat_n(
+            Complex::new(0.0, 0.0),
+            fft_len - signal.len(),
+        ))
+        .collect();
+
+    let mut probe_buf: Vec<Complex<f32>> = probe
+        .iter()
+        .map(|&x| Complex::new(x, 0.0))
+        .chain(std::iter::repeat_n(
+            Complex::new(0.0, 0.0),
+            fft_len - probe.len(),
+        ))
+        .collect();
+
+    fft.process(&mut sig_buf);
+    fft.process(&mut probe_buf);
+
+    let epsilon = 1e-10;
+    for (s, p) in sig_buf.iter_mut().zip(probe_buf.iter()) {
+        let cross = *s * p.conj();
+
+        if phat_weight > 0.0 {
+            let mag = cross.norm();
+            let denom = mag.powf(phat_weight).max(epsilon);
+            *s = cross / denom;
+        } else {
+            *s = cross;
+        }
+    }
+
+    ifft.process(&mut sig_buf);
+
+    let scale = 1.0 / fft_len as f32;
+    sig_buf.iter().take(out_len).map(|c| c.re * scale).collect()
 }
 
 /// Full aperiodic autocorrelation for lags `-(N-1)..=(N-1)`.

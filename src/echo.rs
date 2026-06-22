@@ -1,5 +1,6 @@
 // Copyright (c) 2026 Elias S. G. Carotti
 
+use crate::coupling::CouplingProfile;
 use crate::peak::{find_peaks, parabolic_peak_offset};
 
 /// Configuration for echo detection on a correlation signal.
@@ -12,6 +13,8 @@ pub struct EchoDetector {
     noise_tail_fraction: f32,
     /// Detection threshold as a multiplier over the estimated noise floor.
     threshold_snr: f32,
+    /// Optional coupling profile for direct-path subtraction.
+    coupling: Option<CouplingProfile>,
 }
 
 /// A detected echo with sub-sample precision.
@@ -35,6 +38,7 @@ impl EchoDetector {
             max_distance_m: 5.0,
             noise_tail_fraction: 0.25,
             threshold_snr: 4.0,
+            coupling: None,
         }
     }
 
@@ -58,11 +62,17 @@ impl EchoDetector {
         self
     }
 
+    pub fn coupling(mut self, profile: CouplingProfile) -> Self {
+        self.coupling = Some(profile);
+        self
+    }
+
     /// Detect echoes in a correlation signal.
     ///
-    /// `correlation` is the output of `matched_filter`, `gcc_phat`, or a
-    /// coupling-subtracted residual. The direct-path peak (at/near lag 0) is
-    /// used as a reference — echoes are searched between `min_distance_m` and
+    /// `correlation` is the output of `matched_filter`, `gcc_phat`, or similar.
+    /// If a coupling profile was set, the direct-path signature is subtracted
+    /// before peak detection. The direct-path peak (at/near lag 0) is used as
+    /// a reference — echoes are searched between `min_distance_m` and
     /// `max_distance_m` from it.
     ///
     /// Returns all detected echoes sorted by distance (nearest first).
@@ -71,10 +81,18 @@ impl EchoDetector {
             return Vec::new();
         }
 
-        let abs_corr: Vec<f32> = correlation.iter().map(|x| x.abs()).collect();
+        // Find the direct peak from the original correlation (before
+        // subtraction), since coupling removal suppresses it.
+        let abs_orig: Vec<f32> = correlation.iter().map(|x| x.abs()).collect();
+        let direct_idx = self.find_direct_peak(&abs_orig);
+        let direct_peak = abs_orig[direct_idx];
 
-        let direct_idx = self.find_direct_peak(&abs_corr);
-        let direct_peak = abs_corr[direct_idx];
+        let working = match &self.coupling {
+            Some(profile) => profile.subtract_correlation(correlation, None),
+            None => correlation.to_vec(),
+        };
+
+        let abs_corr: Vec<f32> = working.iter().map(|x| x.abs()).collect();
 
         if direct_peak <= 0.0 {
             return Vec::new();
@@ -186,7 +204,7 @@ fn distance_m_to_lag(distance_m: f32, sample_rate: f32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::correlate::{gcc_phat, matched_filter, normalize_abs};
+    use crate::correlate::{gcc_phat, matched_filter};
     use crate::probe::{apply_hann_window, linear_chirp, normalize_peak};
     use crate::range::distance_m_to_delay_samples;
 
@@ -368,10 +386,41 @@ mod tests {
         let echoes = detector.detect(&corr);
 
         assert!(!echoes.is_empty());
-        // With parabolic interpolation, offset should be non-zero in general
-        // (it's exactly zero only if the peak happens to land on a sample)
-        // Just verify it's in range
         assert!(echoes[0].offset.abs() <= 0.5);
+    }
+
+    #[test]
+    fn coupling_subtraction_reveals_close_echo() {
+        let probe = make_probe();
+        let phat_weight = 0.7;
+        let echo_distance = 0.30;
+
+        // Calibration: direct path only
+        let calibration = synthetic_recording(&probe, 1.0, &[]);
+        let profile =
+            CouplingProfile::from_calibrations(&probe, &[&calibration], SAMPLE_RATE, phat_weight);
+
+        // Measurement with a close echo
+        let recording = synthetic_recording(&probe, 1.0, &[(echo_distance, 0.4)]);
+        let corr = gcc_phat(&recording, &probe, phat_weight);
+
+        // Without coupling: min_distance would need to be large to avoid
+        // direct-path sidelobes. With coupling: we can detect close echoes.
+        let detector = EchoDetector::new(SAMPLE_RATE)
+            .min_distance_m(0.10)
+            .max_distance_m(2.0)
+            .coupling(profile);
+        let echoes = detector.detect(&corr);
+
+        assert!(
+            !echoes.is_empty(),
+            "should detect close echo with coupling subtraction"
+        );
+        assert!(
+            (echoes[0].distance_m - echo_distance).abs() < 0.10,
+            "measured {:.3} m, expected {echo_distance} m",
+            echoes[0].distance_m
+        );
     }
 }
 

@@ -1,19 +1,25 @@
 // Copyright (c) 2026 Elias S. G. Carotti
 
+use crate::correlate::{gcc_phat, matched_filter};
 use crate::coupling::CouplingProfile;
 use crate::peak::{find_peaks, parabolic_peak_offset};
 
-/// Configuration for echo detection on a correlation signal.
+/// Cross-correlation method used by the echo detector.
+#[derive(Debug, Clone, Copy)]
+pub enum Correlator {
+    MatchedFilter,
+    GccPhat { weight: f32 },
+}
+
+/// Configuration for echo detection.
 #[derive(Debug, Clone)]
 pub struct EchoDetector {
     sample_rate: f32,
+    correlator: Correlator,
     min_distance_m: f32,
     max_distance_m: f32,
-    /// Fraction of the correlation tail used to estimate noise floor (0.0–1.0).
     noise_tail_fraction: f32,
-    /// Detection threshold as a multiplier over the estimated noise floor.
     threshold_snr: f32,
-    /// Optional coupling profile for direct-path subtraction.
     coupling: Option<CouplingProfile>,
 }
 
@@ -34,12 +40,18 @@ impl EchoDetector {
     pub fn new(sample_rate: f32) -> Self {
         Self {
             sample_rate,
+            correlator: Correlator::GccPhat { weight: 0.7 },
             min_distance_m: 0.20,
             max_distance_m: 5.0,
             noise_tail_fraction: 0.25,
             threshold_snr: 4.0,
             coupling: None,
         }
+    }
+
+    pub fn correlator(mut self, correlator: Correlator) -> Self {
+        self.correlator = correlator;
+        self
     }
 
     pub fn min_distance_m(mut self, meters: f32) -> Self {
@@ -67,22 +79,29 @@ impl EchoDetector {
         self
     }
 
-    /// Detect echoes in a correlation signal.
+    /// Detect echoes in a recording.
     ///
-    /// `correlation` is the output of `matched_filter`, `gcc_phat`, or similar.
-    /// If a coupling profile was set, the direct-path signature is subtracted
-    /// before peak detection. The direct-path peak (at/near lag 0) is used as
-    /// a reference — echoes are searched between `min_distance_m` and
-    /// `max_distance_m` from it.
+    /// Runs the full pipeline: correlate → coupling subtraction → peak
+    /// detection. Returns all detected echoes sorted by distance (nearest
+    /// first).
+    pub fn detect(&self, recording: &[f32], probe: &[f32]) -> Vec<Echo> {
+        let correlation = match self.correlator {
+            Correlator::MatchedFilter => matched_filter(recording, probe),
+            Correlator::GccPhat { weight } => gcc_phat(recording, probe, weight),
+        };
+
+        self.detect_in_correlation(&correlation)
+    }
+
+    /// Detect echoes in a pre-computed correlation signal.
     ///
-    /// Returns all detected echoes sorted by distance (nearest first).
-    pub fn detect(&self, correlation: &[f32]) -> Vec<Echo> {
+    /// Use this if you need access to the raw correlation yourself, or if you
+    /// computed it with custom parameters.
+    pub fn detect_in_correlation(&self, correlation: &[f32]) -> Vec<Echo> {
         if correlation.len() < 3 {
             return Vec::new();
         }
 
-        // Find the direct peak from the original correlation (before
-        // subtraction), since coupling removal suppresses it.
         let abs_orig: Vec<f32> = correlation.iter().map(|x| x.abs()).collect();
         let direct_idx = self.find_direct_peak(&abs_orig);
         let direct_peak = abs_orig[direct_idx];
@@ -100,16 +119,13 @@ impl EchoDetector {
 
         let noise_floor = self.estimate_noise_floor(&abs_corr, direct_idx);
 
-        // Threshold: max of (noise_floor * snr_threshold) and a fraction of
-        // the direct peak. The direct-peak fraction prevents autocorrelation
-        // sidelobes from triggering false detections.
         let noise_threshold = noise_floor * self.threshold_snr;
         let sidelobe_threshold = direct_peak * 0.15;
         let threshold = noise_threshold.max(sidelobe_threshold);
 
         let min_lag = direct_idx + distance_m_to_lag(self.min_distance_m, self.sample_rate);
         let max_lag = direct_idx + distance_m_to_lag(self.max_distance_m, self.sample_rate);
-        let max_lag = max_lag.min(correlation.len().saturating_sub(2));
+        let max_lag = max_lag.min(abs_corr.len().saturating_sub(2));
 
         if min_lag >= max_lag {
             return Vec::new();
@@ -153,17 +169,13 @@ impl EchoDetector {
     }
 
     fn estimate_noise_floor(&self, abs_corr: &[f32], direct_idx: usize) -> f32 {
-        // Estimate from the tail, excluding the region around the direct peak
         let tail_len = (abs_corr.len() as f32 * self.noise_tail_fraction).round() as usize;
         let tail_start = abs_corr.len().saturating_sub(tail_len);
 
-        // Also exclude a region after max_distance from direct to avoid
-        // counting far echoes as noise
         let safe_start = direct_idx + distance_m_to_lag(self.max_distance_m, self.sample_rate);
         let start = tail_start.max(safe_start).min(abs_corr.len());
 
         if start >= abs_corr.len() {
-            // Fallback: use the last 10% regardless
             let fallback_start = abs_corr.len().saturating_sub(abs_corr.len() / 10);
             let tail = &abs_corr[fallback_start..];
             if tail.is_empty() {
@@ -183,7 +195,6 @@ impl EchoDetector {
     }
 
     fn find_direct_peak(&self, abs_corr: &[f32]) -> usize {
-        // Direct peak should be within the first few ms
         let search_window = (self.sample_rate as usize / 100).min(abs_corr.len());
 
         abs_corr
@@ -204,7 +215,6 @@ fn distance_m_to_lag(distance_m: f32, sample_rate: f32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::correlate::{gcc_phat, matched_filter};
     use crate::probe::{apply_hann_window, linear_chirp, normalize_peak};
     use crate::range::distance_m_to_delay_samples;
 
@@ -245,10 +255,10 @@ mod tests {
         let echo_distance = 1.5;
         let rx = synthetic_recording(&probe, 1.0, &[(echo_distance, 0.3)]);
 
-        let corr = matched_filter(&rx, &probe);
-
-        let detector = EchoDetector::new(SAMPLE_RATE).max_distance_m(4.0);
-        let echoes = detector.detect(&corr);
+        let detector = EchoDetector::new(SAMPLE_RATE)
+            .correlator(Correlator::MatchedFilter)
+            .max_distance_m(4.0);
+        let echoes = detector.detect(&rx, &probe);
 
         assert!(!echoes.is_empty(), "should detect at least one echo");
         assert!(
@@ -264,12 +274,29 @@ mod tests {
         let echo_distance = 1.5;
         let rx = synthetic_recording(&probe, 1.0, &[(echo_distance, 0.3)]);
 
-        let corr = gcc_phat(&rx, &probe, 0.7);
-
-        let detector = EchoDetector::new(SAMPLE_RATE).max_distance_m(4.0);
-        let echoes = detector.detect(&corr);
+        let detector = EchoDetector::new(SAMPLE_RATE)
+            .correlator(Correlator::GccPhat { weight: 0.7 })
+            .max_distance_m(4.0);
+        let echoes = detector.detect(&rx, &probe);
 
         assert!(!echoes.is_empty(), "should detect at least one echo");
+        assert!(
+            (echoes[0].distance_m - echo_distance).abs() < 0.05,
+            "measured {:.3} m, expected {echo_distance} m",
+            echoes[0].distance_m
+        );
+    }
+
+    #[test]
+    fn default_correlator_is_gcc_phat() {
+        let probe = make_probe();
+        let echo_distance = 1.5;
+        let rx = synthetic_recording(&probe, 1.0, &[(echo_distance, 0.3)]);
+
+        let detector = EchoDetector::new(SAMPLE_RATE).max_distance_m(4.0);
+        let echoes = detector.detect(&rx, &probe);
+
+        assert!(!echoes.is_empty(), "default should detect echo");
         assert!(
             (echoes[0].distance_m - echo_distance).abs() < 0.05,
             "measured {:.3} m, expected {echo_distance} m",
@@ -282,12 +309,11 @@ mod tests {
         let probe = make_probe();
         let rx = synthetic_recording(&probe, 1.0, &[(0.40, 0.5), (1.5, 0.3)]);
 
-        let corr = matched_filter(&rx, &probe);
-
         let detector = EchoDetector::new(SAMPLE_RATE)
+            .correlator(Correlator::MatchedFilter)
             .min_distance_m(1.0)
             .max_distance_m(4.0);
-        let echoes = detector.detect(&corr);
+        let echoes = detector.detect(&rx, &probe);
 
         assert!(!echoes.is_empty());
         assert!(
@@ -302,10 +328,10 @@ mod tests {
         let probe = make_probe();
         let rx = synthetic_recording(&probe, 1.0, &[(1.0, 0.3), (8.0, 0.5)]);
 
-        let corr = matched_filter(&rx, &probe);
-
-        let detector = EchoDetector::new(SAMPLE_RATE).max_distance_m(3.0);
-        let echoes = detector.detect(&corr);
+        let detector = EchoDetector::new(SAMPLE_RATE)
+            .correlator(Correlator::MatchedFilter)
+            .max_distance_m(3.0);
+        let echoes = detector.detect(&rx, &probe);
 
         for echo in &echoes {
             assert!(
@@ -321,10 +347,10 @@ mod tests {
         let probe = make_probe();
         let rx = synthetic_recording(&probe, 1.0, &[(0.80, 0.4), (2.0, 0.25)]);
 
-        let corr = matched_filter(&rx, &probe);
-
-        let detector = EchoDetector::new(SAMPLE_RATE).max_distance_m(4.0);
-        let echoes = detector.detect(&corr);
+        let detector = EchoDetector::new(SAMPLE_RATE)
+            .correlator(Correlator::MatchedFilter)
+            .max_distance_m(4.0);
+        let echoes = detector.detect(&rx, &probe);
 
         assert!(
             echoes.len() >= 2,
@@ -340,12 +366,11 @@ mod tests {
         let probe = make_probe();
         let rx = synthetic_recording(&probe, 1.0, &[(1.0, 0.3)]);
 
-        let corr = matched_filter(&rx, &probe);
-
         let detector = EchoDetector::new(SAMPLE_RATE)
+            .correlator(Correlator::MatchedFilter)
             .max_distance_m(4.0)
             .threshold_snr(3.0);
-        let echoes = detector.detect(&corr);
+        let echoes = detector.detect(&rx, &probe);
 
         for echo in &echoes {
             assert!(
@@ -359,13 +384,12 @@ mod tests {
     #[test]
     fn no_false_echoes_in_silence() {
         let probe = make_probe();
-        // Only direct path, no reflections, long tail
         let rx = synthetic_recording(&probe, 1.0, &[]);
 
-        let corr = matched_filter(&rx, &probe);
-
-        let detector = EchoDetector::new(SAMPLE_RATE).max_distance_m(4.0);
-        let echoes = detector.detect(&corr);
+        let detector = EchoDetector::new(SAMPLE_RATE)
+            .correlator(Correlator::MatchedFilter)
+            .max_distance_m(4.0);
+        let echoes = detector.detect(&rx, &probe);
 
         assert!(
             echoes.is_empty(),
@@ -380,10 +404,10 @@ mod tests {
         let echo_distance = 1.0;
         let rx = synthetic_recording(&probe, 1.0, &[(echo_distance, 0.3)]);
 
-        let corr = matched_filter(&rx, &probe);
-
-        let detector = EchoDetector::new(SAMPLE_RATE).max_distance_m(4.0);
-        let echoes = detector.detect(&corr);
+        let detector = EchoDetector::new(SAMPLE_RATE)
+            .correlator(Correlator::MatchedFilter)
+            .max_distance_m(4.0);
+        let echoes = detector.detect(&rx, &probe);
 
         assert!(!echoes.is_empty());
         assert!(echoes[0].offset.abs() <= 0.5);
@@ -395,22 +419,20 @@ mod tests {
         let phat_weight = 0.7;
         let echo_distance = 0.30;
 
-        // Calibration: direct path only
         let calibration = synthetic_recording(&probe, 1.0, &[]);
         let profile =
             CouplingProfile::from_calibrations(&probe, &[&calibration], SAMPLE_RATE, phat_weight);
 
-        // Measurement with a close echo
         let recording = synthetic_recording(&probe, 1.0, &[(echo_distance, 0.4)]);
-        let corr = gcc_phat(&recording, &probe, phat_weight);
 
-        // Without coupling: min_distance would need to be large to avoid
-        // direct-path sidelobes. With coupling: we can detect close echoes.
         let detector = EchoDetector::new(SAMPLE_RATE)
+            .correlator(Correlator::GccPhat {
+                weight: phat_weight,
+            })
             .min_distance_m(0.10)
             .max_distance_m(2.0)
             .coupling(profile);
-        let echoes = detector.detect(&corr);
+        let echoes = detector.detect(&recording, &probe);
 
         assert!(
             !echoes.is_empty(),

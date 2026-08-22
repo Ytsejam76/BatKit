@@ -46,6 +46,7 @@ pub struct EchoDetector {
     sample_rate: f32,
     correlator: Correlator,
     window: Window,
+    direct_search_window_ms: f32,
     min_distance_m: f32,
     max_distance_m: f32,
     noise_tail_fraction: f32,
@@ -72,6 +73,7 @@ impl EchoDetector {
             sample_rate,
             correlator: Correlator::GccPhat { weight: 0.7 },
             window: Window::None,
+            direct_search_window_ms: 10.0,
             min_distance_m: 0.20,
             max_distance_m: 5.0,
             noise_tail_fraction: 0.25,
@@ -92,6 +94,15 @@ impl EchoDetector {
     /// untouched.
     pub fn window(mut self, window: Window) -> Self {
         self.window = window;
+        self
+    }
+
+    /// Search window used to identify the direct path, in milliseconds.
+    ///
+    /// Keep this wide enough to cover the playback/recording latency of the
+    /// host platform. The default remains conservative for existing users.
+    pub fn direct_search_window_ms(mut self, window_ms: f32) -> Self {
+        self.direct_search_window_ms = window_ms.max(1.0);
         self
     }
 
@@ -282,7 +293,10 @@ impl EchoDetector {
     }
 
     fn find_direct_peak(&self, abs_corr: &[f32]) -> usize {
-        let search_window = (self.sample_rate as usize / 100).min(abs_corr.len());
+        let search_window = ((self.sample_rate * self.direct_search_window_ms / 1_000.0)
+            .round() as usize)
+            .max(1)
+            .min(abs_corr.len());
 
         abs_corr
             .iter()
@@ -425,6 +439,31 @@ mod tests {
         assert!(
             echoes[0].distance_m >= 0.95,
             "should skip echo below min_distance, got {:.3} m",
+            echoes[0].distance_m
+        );
+    }
+
+    #[test]
+    fn detects_delayed_direct_path_with_wider_search_window() {
+        let probe = make_probe();
+        let echo_distance = 0.50;
+        let rx = synthetic_recording(
+            &probe,
+            distance_m_to_delay_samples(1.2, SAMPLE_RATE),
+            1.0,
+            &[(echo_distance, 0.3)],
+        );
+
+        let detector = EchoDetector::new(SAMPLE_RATE)
+            .correlator(Correlator::MatchedFilter)
+            .direct_search_window_ms(200.0)
+            .max_distance_m(4.0);
+        let echoes = detector.detect(Recording::Single(&rx), &probe);
+
+        assert!(!echoes.is_empty());
+        assert!(
+            (echoes[0].distance_m - echo_distance).abs() < 0.08,
+            "measured {:.3} m, expected {echo_distance} m",
             echoes[0].distance_m
         );
     }
